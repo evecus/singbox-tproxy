@@ -1,6 +1,9 @@
-name: Auto Release TProxy Helper
+name: Build and Release
 on:
   workflow_dispatch: # 支持手动触发
+
+permissions:
+  contents: write # 必须赋予写入权限
 
 jobs:
   build:
@@ -12,7 +15,7 @@ jobs:
           - arch: arm64
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
@@ -22,8 +25,10 @@ jobs:
           go build -ldflags "-s -w" -o sing-box-tproxy-${{ matrix.arch }} main.go
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2 # 使用 v2 版本更稳定
         with:
           files: sing-box-tproxy-${{ matrix.arch }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
