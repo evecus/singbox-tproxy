@@ -1,7 +1,7 @@
 name: Release TProxy
+
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch: # 支持手动触发
 
 jobs:
   release:
