@@ -41,7 +41,7 @@ func main() {
 	port := getTProxyPort(*configPath)
 	cleanup()
 	if err := setup(*lan, *ipv6Mode, port); err != nil {
-		log.Fatalf("规则应用失败: %v", err)
+		log.Fatalf("规则应用失败 (请检查内核 TProxy 支持): %v", err)
 	}
 
 	cmd := exec.Command("/usr/bin/sing-box", "run", "-c", *configPath)
@@ -59,7 +59,7 @@ func main() {
 	}()
 
 	<-sigChan
-	fmt.Println("\n正在清理规则...")
+	fmt.Println("\n正在清理规则并退出...")
 	cleanup()
 }
 
@@ -70,7 +70,6 @@ func ensureSingBox() {
 	}
 
 	fmt.Println("[!] 未检测到核心，正在下载最新版本...")
-	// 自动识别架构并匹配 GitHub Release 文件名
 	arch := runtime.GOARCH
 	version := "1.10.1" 
 	url := fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz", version, version, arch)
