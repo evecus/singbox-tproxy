@@ -1,4 +1,4 @@
-name: Release TProxy
+name: Auto Release TProxy Helper
 on:
   workflow_dispatch: # 支持手动触发
 
@@ -16,20 +16,10 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Initialize Module
-        run: |
-          rm -f go.mod go.sum
-          go mod init sing-box-tproxy
-          # 显式获取 sing-box 核心
-          go get github.com/sagernet/sing-box@latest
-          go mod tidy
-
       - name: Build
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
-          go build -v -trimpath -ldflags "-s -w -buildid=" \
-          -tags "with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_clash_api" \
-          -o sing-box-tproxy-${{ matrix.arch }} main.go
+          go build -ldflags "-s -w" -o sing-box-tproxy-${{ matrix.arch }} main.go
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
