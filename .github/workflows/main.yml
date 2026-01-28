@@ -1,8 +1,17 @@
-name: Release TProxy Binary
+name: Multi-Arch Build
 on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            goos: linux
+            binary_name: sing-box-tproxy-linux-amd64
+          - goarch: arm64
+            goos: linux
+            binary_name: sing-box-tproxy-linux-arm64
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
@@ -11,10 +20,10 @@ jobs:
           go-version: '1.21'
       - name: Build
         run: |
-          # 使用静态链接确保在不同发行版上都能运行
-          CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o sing-box-tproxy main.go
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          go build -ldflags "-s -w" -o ${{ matrix.binary_name }} main.go
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-tproxy
-          path: sing-box-tproxy
+          name: ${{ matrix.binary_name }}
+          path: ${{ matrix.binary_name }}
