@@ -1,9 +1,11 @@
 name: Build and Release
 on:
-  workflow_dispatch: # 支持手动触发
+  push:
+    branches: [ "main", "master" ] # 即使不打 tag，推送到主分支也会触发
+    tags: [ "v*" ]
 
 permissions:
-  contents: write # 必须：允许 Actions 写入 Release 附件
+  contents: write
 
 jobs:
   build:
@@ -27,7 +29,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          # 如果没有 tag，就使用 'latest' 标签名，并开启自动打标 (tag_name: latest)
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           files: sing-box-tproxy-${{ matrix.arch }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Latest Auto Build' }}
+          body: "Auto compiled binary for sing-box TProxy helper."
           draft: false
           prerelease: false
         env:
