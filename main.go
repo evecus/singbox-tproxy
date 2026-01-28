@@ -17,136 +17,134 @@ import (
 	"syscall"
 )
 
-type SBConfig struct {
+type Config struct {
 	Inbounds []struct {
 		Type   string `json:"type"`
 		Listen int    `json:"listen_port"`
 	} `json:"inbounds"`
 }
 
+const targetPath = "/usr/bin/sing-box"
+
 func main() {
-	lan := flag.String("lan", "", "内网网段 (例: 192.168.31.0/24)")
-	ipv6Mode := flag.String("ipv6", "disable", "IPv6 模式: enable 或 disable")
-	configPath := flag.String("c", "", "config.json 路径")
+	lan := flag.String("lan", "", "内网网段 (例: 10.0.0.0/24)")
+	configPath := flag.String("c", "", "配置文件路径")
 	flag.Parse()
 
 	if *lan == "" || *configPath == "" {
-		fmt.Println("用法: sudo ./sing-box-tproxy --lan 192.168.31.0/24 --ipv6 disable -c config.json")
+		fmt.Println("用法: sudo ./sing-box-tproxy --lan 10.0.0.0/24 -c config.json")
 		os.Exit(1)
 	}
 
-	ensureNftables()
-	ensureSingBox()
+	// 1. 强制安装/更新核心到 /usr/bin/sing-box
+	syncSingBox()
 
-	port := getTProxyPort(*configPath)
+	// 2. 清理旧规则并应用新规则
 	cleanup()
-
-	if err := setup(*lan, *ipv6Mode, port); err != nil {
-		log.Fatalf("规则应用失败: %v", err)
+	port := getTProxyPort(*configPath)
+	if err := setupRules(*lan, port); err != nil {
+		log.Fatalf("规则设置失败: %v", err)
 	}
 
-	// 启动核心进程
-	cmd := exec.Command("/usr/bin/sing-box", "run", "-c", *configPath)
+	// 3. 运行核心
+	cmd := exec.Command(targetPath, "run", "-c", *configPath)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := cmd.Start(); err != nil { log.Fatalf("运行失败: %v", err) }
+		if err := cmd.Start(); err != nil {
+			log.Fatalf("核心启动失败: %v", err)
+		}
 		cmd.Wait()
 		sigChan <- syscall.SIGTERM
 	}()
 
+	fmt.Printf("[+] 透明代理运行中。核心路径: %s\n", targetPath)
 	<-sigChan
-	fmt.Println("\n[-] 收到退出信号，正在清理环境...")
 	cleanup()
 }
 
-func ensureSingBox() {
-	target := "/usr/bin/sing-box"
-	if _, err := os.Stat(target); err == nil { return }
+func syncSingBox() {
+	// 获取 GitHub 最新版本号
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, _ := client.Get("https://github.com/SagerNet/sing-box/releases/latest")
+	loc := resp.Header.Get("Location")
+	latestVer := loc[strings.LastIndex(loc, "/v")+2:]
 
-	fmt.Println("[!] 正在下载最新 sing-box 核心...")
+	// 检查当前 /usr/bin/sing-box 是否已经是最新版
+	if _, err := os.Stat(targetPath); err == nil {
+		out, _ := exec.Command(targetPath, "version").Output()
+		if strings.Contains(string(out), latestVer) {
+			fmt.Println("[+] /usr/bin/sing-box 已经是最新版本 v" + latestVer)
+			return
+		}
+	}
+
+	fmt.Printf("[!] 正在强制下载并安装最新核心 v%s 到 %s...\n", latestVer, targetPath)
 	arch := runtime.GOARCH
-	// 动态匹配架构名
-	ver := "1.10.1"
-	url := fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz", ver, ver, arch)
-
-	resp, err := http.Get(url)
-	if err != nil { log.Fatal("网络故障，下载核心失败") }
-	defer resp.Body.Close()
-
-	gr, _ := gzip.NewReader(resp.Body)
+	url := fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz", latestVer, latestVer, arch)
+	
+	dResp, _ := http.Get(url)
+	defer dResp.Body.Close()
+	gr, _ := gzip.NewReader(dResp.Body)
 	tr := tar.NewReader(gr)
 	for {
-		hdr, err := tr.Next()
-		if err == io.EOF { break }
+		hdr, _ := tr.Next()
 		if strings.HasSuffix(hdr.Name, "/sing-box") {
-			f, _ := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0755)
+			f, _ := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 			io.Copy(f, tr)
 			f.Close()
-			return
+			break
 		}
 	}
 }
 
-func ensureNftables() {
-	if _, err := exec.LookPath("nft"); err != nil {
-		fmt.Println("[!] 自动安装 nftables...")
-		exec.Command("apt-get", "update").Run()
-		exec.Command("apt-get", "install", "-y", "nftables").Run()
-	}
-	exec.Command("systemctl", "enable", "--now", "nftables").Run()
-}
-
 func getTProxyPort(path string) string {
-	f, err := os.ReadFile(path)
-	if err != nil { log.Fatal("读取 config.json 失败") }
-	var cfg SBConfig
-	json.Unmarshal(f, &cfg)
+	file, _ := os.ReadFile(path)
+	var cfg Config
+	json.Unmarshal(file, &cfg)
 	for _, in := range cfg.Inbounds {
 		if in.Type == "tproxy" { return fmt.Sprintf("%d", in.Listen) }
 	}
 	return "7893"
 }
 
-func setup(lan, ipv6, port string) error {
-	// 参考了你上传的 sing-box.nft
+func setupRules(lan, port string) error {
+	// 重点：在 output 链也加入对保留地址的排除
 	nftRules := fmt.Sprintf(`
 	table inet singbox_tproxy {
-		set reserved_ip4 { type ipv4_addr; flags interval; elements = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } }
+		set RESERVED_IP { 
+			type ipv4_addr; flags interval; 
+			elements = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } 
+		}
 		chain prerouting {
 			type filter hook prerouting priority mangle; policy accept;
-			ip daddr @reserved_ip4 return
+			ip daddr @RESERVED_IP return
 			ip daddr %s return
 			meta l4proto { tcp, udp } tproxy to :%s meta mark set 1
 		}
 		chain output {
 			type route hook output priority mangle; policy accept;
+			# 解决断网的关键：机器发出的回程包必须排除在打标范围外
+			ip daddr @RESERVED_IP return
+			ip daddr %s return
 			meta mark 1 return
 			meta l4proto { tcp, udp } meta mark set 1
 		}
-	}`, lan, port)
+	}`, lan, port, lan)
 
 	os.WriteFile("/tmp/sb.nft", []byte(nftRules), 0644)
-	if out, err := exec.Command("nft", "-f", "/tmp/sb.nft").CombinedOutput(); err != nil {
-		return fmt.Errorf("%s", string(out))
-	}
-	// 参考了你上传的 tproxy.sh
+	exec.Command("nft", "-f", "/tmp/sb.nft").Run()
 	exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
-	if ipv6 == "enable" {
-		exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run()
-		exec.Command("ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
-	}
 	return nil
 }
 
 func cleanup() {
+	fmt.Println("[-] 清理规则...")
 	exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run()
 	exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
-	exec.Command("ip", "-6", "rule", "del", "fwmark", "1", "lookup", "100").Run()
-	exec.Command("ip", "-6", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
 }
