@@ -33,49 +33,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 1. 环境准备
 	ensureNftables()
 	port := getTProxyPort(*configPath)
 	
-	cleanup() // 启动前清理残留规则 [cite: 8-12]
+	[cite_start]// 2. 配置网络规则 [cite: 1, 4, 13]
+	cleanup() 
 	if err := setup(*lan, *ipv6Mode, port); err != nil {
-		log.Fatalf("规则应用失败 (请检查内核 TProxy 支持): %v", err)
+		log.Fatalf("网络规则设置失败: %v", err)
 	}
 
+	// 3. 启动核心
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	content, _ := os.ReadFile(*configPath)
+	content, err := os.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf("读取配置失败: %v", err)
+	}
+
+	// 使用最新版本的 Options 初始化
 	instance, err := box.New(box.Options{
-		Context: ctx,
+		Context:       ctx,
 		ConfigContent: string(content),
 	})
 	if err != nil {
-		log.Fatalf("核心创建失败: %v", err)
+		log.Fatalf("核心初始化失败: %v", err)
 	}
 
 	if err := instance.Start(); err != nil {
 		log.Fatalf("核心启动失败: %v", err)
 	}
 
-	fmt.Println("[+] 代理引擎与 TProxy 规则已就绪")
+	fmt.Println("[+] 代理引擎与 TProxy 规则已成功运行")
 
+	// 4. 信号处理
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	fmt.Println("\n[-] 正在清理环境并退出...")
+	fmt.Println("\n[-] 正在清理并关闭...")
 	instance.Close()
-	cleanup() // 退出清理 [cite: 8-12]
+	[cite_start]cleanup() // [cite: 8, 11]
 }
+
+// --- 辅助函数保持一致 ---
 
 func ensureNftables() {
 	if _, err := exec.LookPath("nft"); err != nil {
-		fmt.Println("[!] 未发现 nftables，正在安装...")
-		managers := map[string]string{
-			"apt-get": "install -y nftables",
-			"yum":     "install -y nftables",
-			"pacman":  "-S --noconfirm nftables",
-		}
+		managers := map[string]string{"apt-get": "install -y nftables", "yum": "install -y nftables", "pacman": "-S --noconfirm nftables"}
 		for m, args := range managers {
 			if _, e := exec.LookPath(m); e == nil {
 				if m == "apt-get" { exec.Command(m, "update").Run() }
@@ -84,7 +90,7 @@ func ensureNftables() {
 			}
 		}
 	}
-	exec.Command("systemctl", "enable", "--now", "nftables").Run()
+	[cite_start]exec.Command("systemctl", "enable", "--now", "nftables").Run() // [cite: 1]
 }
 
 func getTProxyPort(path string) string {
@@ -94,7 +100,7 @@ func getTProxyPort(path string) string {
 	for _, in := range cfg.Inbounds {
 		if in.Type == "tproxy" { return fmt.Sprintf("%d", in.Listen) }
 	}
-	log.Fatal("未在 config.json 中发现 tproxy 入站端口")
+	log.Fatal("未找到 tproxy 入站端口")
 	return ""
 }
 
@@ -112,27 +118,26 @@ func setup(lan, ipv6, port string) error {
 			meta mark 1 return
 			meta l4proto { tcp, udp } meta mark set 1
 		}
-	}`, lan, port) [cite: 13-17]
+	[cite_start]}`, lan, port) // [cite: 13, 16]
 
-	tmp := "/tmp/sb.nft"
-	os.WriteFile(tmp, []byte(nftCmd), 0644)
-	if out, err := exec.Command("nft", "-f", tmp).CombinedOutput(); err != nil {
+	os.WriteFile("/tmp/sb.nft", []byte(nftCmd), 0644)
+	if out, err := exec.Command("nft", "-f", "/tmp/sb.nft").CombinedOutput(); err != nil {
 		return fmt.Errorf("%s", string(out))
 	}
 
-	exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run() [cite: 4-5]
+	[cite_start]exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run() // [cite: 4]
 	exec.Command("ip", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
 	if ipv6 == "enable" {
-		exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run() [cite: 6-7]
+		[cite_start]exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run() // [cite: 6]
 		exec.Command("ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
 	}
 	return nil
 }
 
 func cleanup() {
-	exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run() [cite: 11]
-	exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run() [cite: 9]
+	[cite_start]exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run() // [cite: 11]
+	[cite_start]exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run() // [cite: 9]
 	exec.Command("ip", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
-	exec.Command("ip", "-6", "rule", "del", "fwmark", "1", "lookup", "100").Run() [cite: 10]
+	exec.Command("ip", "-6", "rule", "del", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "-6", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
 }
