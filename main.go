@@ -12,10 +12,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/sagernet/sing-box/box"
+	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/option"
 )
 
-type Config struct {
+type SBConfig struct {
 	Inbounds []struct {
 		Type   string `json:"type"`
 		Listen int    `json:"listen_port"`
@@ -33,17 +34,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 1. 环境准备
 	ensureNftables()
 	port := getTProxyPort(*configPath)
 	
-	[cite_start]// 2. 配置网络规则 [cite: 1, 4, 13]
 	cleanup() 
 	if err := setup(*lan, *ipv6Mode, port); err != nil {
 		log.Fatalf("网络规则设置失败: %v", err)
 	}
 
-	// 3. 启动核心
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -52,10 +50,14 @@ func main() {
 		log.Fatalf("读取配置失败: %v", err)
 	}
 
-	// 使用最新版本的 Options 初始化
-	instance, err := box.New(box.Options{
-		Context:       ctx,
-		ConfigContent: string(content),
+	var options option.Options
+	if err := json.Unmarshal(content, &options); err != nil {
+		log.Fatalf("解析配置失败: %v", err)
+	}
+
+	instance, err := singbox.New(singbox.Options{
+		Context: ctx,
+		Options: options,
 	})
 	if err != nil {
 		log.Fatalf("核心初始化失败: %v", err)
@@ -65,19 +67,16 @@ func main() {
 		log.Fatalf("核心启动失败: %v", err)
 	}
 
-	fmt.Println("[+] 代理引擎与 TProxy 规则已成功运行")
+	fmt.Println("[+] Sing-box 嵌入式核心与 TProxy 规则已成功启动")
 
-	// 4. 信号处理
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	fmt.Println("\n[-] 正在清理并关闭...")
+	fmt.Println("\n[-] 正在清理并退出...")
 	instance.Close()
-	[cite_start]cleanup() // [cite: 8, 11]
+	cleanup()
 }
-
-// --- 辅助函数保持一致 ---
 
 func ensureNftables() {
 	if _, err := exec.LookPath("nft"); err != nil {
@@ -90,17 +89,17 @@ func ensureNftables() {
 			}
 		}
 	}
-	[cite_start]exec.Command("systemctl", "enable", "--now", "nftables").Run() // [cite: 1]
+	exec.Command("systemctl", "enable", "--now", "nftables").Run()
 }
 
 func getTProxyPort(path string) string {
 	file, _ := os.ReadFile(path)
-	var cfg Config
+	var cfg SBConfig
 	json.Unmarshal(file, &cfg)
 	for _, in := range cfg.Inbounds {
 		if in.Type == "tproxy" { return fmt.Sprintf("%d", in.Listen) }
 	}
-	log.Fatal("未找到 tproxy 入站端口")
+	log.Fatal("未在配置中找到 tproxy 入站端口")
 	return ""
 }
 
@@ -118,25 +117,25 @@ func setup(lan, ipv6, port string) error {
 			meta mark 1 return
 			meta l4proto { tcp, udp } meta mark set 1
 		}
-	[cite_start]}`, lan, port) // [cite: 13, 16]
+	}`, lan, port)
 
 	os.WriteFile("/tmp/sb.nft", []byte(nftCmd), 0644)
 	if out, err := exec.Command("nft", "-f", "/tmp/sb.nft").CombinedOutput(); err != nil {
 		return fmt.Errorf("%s", string(out))
 	}
 
-	[cite_start]exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run() // [cite: 4]
+	exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
 	if ipv6 == "enable" {
-		[cite_start]exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run() // [cite: 6]
+		exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run()
 		exec.Command("ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
 	}
 	return nil
 }
 
 func cleanup() {
-	[cite_start]exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run() // [cite: 11]
-	[cite_start]exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run() // [cite: 9]
+	exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run()
+	exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
 	exec.Command("ip", "-6", "rule", "del", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "-6", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
