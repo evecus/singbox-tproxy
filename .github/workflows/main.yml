@@ -1,37 +1,38 @@
 name: Release TProxy
-
 on:
-  workflow_dispatch: # 支持手动触发
+  push:
+    tags: ["v*"]
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - arch: amd64
-            os: linux
           - arch: arm64
-            os: linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: '1.22' # 建议使用较新版本以支持 sing-box 依赖
+          go-version: '1.22'
 
-      - name: Prepare Deps
+      - name: Initialize Module
         run: |
-          go mod init sing-box-tproxy || true
+          rm -f go.mod go.sum
+          go mod init sing-box-tproxy
+          # 显式获取 sing-box 核心
+          go get github.com/sagernet/sing-box@latest
           go mod tidy
 
       - name: Build
         run: |
-          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
           go build -v -trimpath -ldflags "-s -w -buildid=" \
-          -tags "with_quic,with_dhcp,with_wireguard,with_ech,with_utls" \
+          -tags "with_quic,with_dhcp,with_wireguard,with_ech,with_utls,with_clash_api" \
           -o sing-box-tproxy-${{ matrix.arch }} main.go
 
-      - name: Upload to Release
+      - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: sing-box-tproxy-${{ matrix.arch }}
