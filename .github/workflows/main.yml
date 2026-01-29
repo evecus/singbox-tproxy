@@ -1,40 +1,36 @@
-name: Build and Release
+name: Build Integrated TProxy
+
 on:
   push:
-    branches: [ "main", "master" ] # 即使不打 tag，推送到主分支也会触发
-    tags: [ "v*" ]
-
-permissions:
-  contents: write
+    branches: [ "main" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-          - arch: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
+    - uses: actions/checkout@v4
 
-      - name: Build
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
-          go build -ldflags "-s -w" -o sing-box-tproxy-${{ matrix.arch }} main.go
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          # 如果没有 tag，就使用 'latest' 标签名，并开启自动打标 (tag_name: latest)
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
-          files: sing-box-tproxy-${{ matrix.arch }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Latest Auto Build' }}
-          body: "Auto compiled binary for sing-box TProxy helper."
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Download Sing-box Core
+      run: |
+        # 自动抓取最新版并存为 main.go 需要的 sing-box-core
+        LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+        URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_TAG}/sing-box-${LATEST_TAG}-linux-arm64.tar.gz"
+        curl -L $URL -o sb.tar.gz
+        tar -xzf sb.tar.gz
+        # 移动二进制文件并命名为 embed 目标
+        find . -name "sing-box" -type f -exec cp {} ./sing-box-core \;
+
+    - name: Compile
+      run: |
+        GOOS=linux GOARCH=arm64 go build -o sing-box-tproxy-arm64 main.go
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: sing-box-tproxy-arm64
+        path: sing-box-tproxy-arm64
