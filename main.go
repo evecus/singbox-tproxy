@@ -122,68 +122,64 @@ func getTProxyPortOrDie(path string) string {
 }
 
 func setupRules(lan, ipv6Mode, port string) error {
-	// 部署前确保清理干净旧表和旧路由，防止重复添加
 	cleanupNetwork()
 
-	// IPv6 保留地址 (根据你的 .nft 文件定义)
-	v6Bypass := ""
+	// 1. 构建 IPv6 排除逻辑字符串
+	v6Rules := ""
 	if ipv6Mode == "enable" {
-		v6Bypass = `
-		ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001::/32, 2001:20::/28, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 } return
-		`
+		v6Rules = "ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001::/32, 2001:20::/28, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 } return"
 	}
 
-	// 整合你提供的 .nft 文件逻辑
+	// 2. 这里的模板采用了更标准的 nft 语法
 	nftRules := fmt.Sprintf(`
-	table inet singbox_tproxy {
-		set RESERVED_IP4 { 
-			type ipv4_addr; flags interval; 
-			elements = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 } 
-		}
+table inet singbox_tproxy {
+    # 将集合放在 chain 外面，以便多个 chain 共享
+    set RESERVED_IP4 { 
+        type ipv4_addr; flags interval; 
+        elements = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 } 
+    }
 
-		chain prerouting {
-			type filter hook prerouting priority mangle; policy accept;
-			
-			# 排除保留地址
-			ip daddr @RESERVED_IP4 return
-			%s
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        
+        ip daddr @RESERVED_IP4 return
+        %s
+        
+        # 排除局域网非 DNS 流量
+        ip daddr %s tcp dport != 53 return
+        ip daddr %s udp dport != 53 return
 
-			# 排除局域网 DNS 以外的流量
-			ip daddr %s tcp dport != 53 return
-			ip daddr %s udp dport != 53 return
+        meta l4proto { tcp, udp } tproxy to :%s meta mark set 1
+    }
 
-			# TProxy 核心规则
-			meta l4proto { tcp, udp } tproxy to :%s meta mark set 1
-		}
+    chain output {
+        type route hook output priority mangle; policy accept;
+        
+        ip daddr @RESERVED_IP4 return
+        %s
 
-		chain output {
-			type route hook output priority mangle; policy accept;
-			
-			# 排除保留地址
-			ip daddr @RESERVED_IP4 return
-			%s
+        # 环路保护
+        meta mark 0x00001ed5 return
+        meta mark 1 return
 
-			# 防止环路 (7893 十进制 = 0x1ed5)
-			meta mark 0x00001ed5 return
-			meta mark 1 return
+        meta l4proto { tcp, udp } meta mark set 1
+    }
+}`, v6Rules, lan, lan, port, v6Rules)
 
-			# 标记剩余流量
-			meta l4proto { tcp, udp } meta mark set 1
-		}
-	}`, v6Bypass, lan, lan, port, v6Bypass)
-
-	if err := os.WriteFile("/tmp/sb.nft", []byte(nftRules), 0644); err != nil {
-		return err
+	// 调试用：如果还是报错，你可以查看这个文件
+	os.WriteFile("/tmp/sb.nft", []byte(nftRules), 0644)
+	
+	// 执行加载
+	cmd := exec.Command("nft", "-f", "/tmp/sb.nft")
+	var errOut strings.Builder
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("nft 语法错误: %s", errOut.String())
 	}
-	if err := exec.Command("nft", "-f", "/tmp/sb.nft").Run(); err != nil {
-		return fmt.Errorf("nft 加载失败: %v", err)
-	}
 
-	// 加载策略路由 (IPv4)
+	// 策略路由
 	exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run()
 	exec.Command("ip", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
-	
-	// 加载策略路由 (IPv6)
 	if ipv6Mode == "enable" {
 		exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run()
 		exec.Command("ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
