@@ -20,7 +20,7 @@ import (
 var boxEmbed embed.FS
 
 const (
-	TableName    = "sb_tproxy_ultimate"
+	TableName    = "sb_tproxy_master"
 	RouteTable   = 100
 	FwMark       = 0x1
 	SingBoxPath  = "/usr/bin/sing-box"
@@ -29,7 +29,7 @@ const (
 func main() {
 	app := &cli.App{
 		Name:  "sb-manager",
-		Usage: "自带内核的 Sing-box 旁路由全功能管理器 (支持 TPROXY, DNS 劫持, NAT 转发)",
+		Usage: "Sing-box 旁路由终极管理器",
 		Commands: []*cli.Command{
 			{
 				Name:  "run",
@@ -50,36 +50,33 @@ func runManager(c *cli.Context) error {
 	configPath := c.String("config")
 
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("必须以 root 权限运行，请使用 sudo")
+		return fmt.Errorf("必须以 root 权限运行")
 	}
 
 	configData, err := ioutil.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("读取配置文件失败: %v", err)
+		return fmt.Errorf("读取配置失败: %v", err)
 	}
 
-	// 解析配置
+	// 1. 自动解析端口 (根据您的配置：TPROXY 7893, DNS 1053)
 	tproxyPort := gjson.Get(string(configData), `inbounds.#(type=="tproxy").listen_port`).Int()
-	if tproxyPort == 0 {
-		return fmt.Errorf("错误: config.json 中未找到 tproxy 类型的 listen_port")
-	}
 	dnsPort := gjson.Get(string(configData), `inbounds.#(tag=="dns-in").listen_port`).Int()
-	if dnsPort == 0 {
-		dnsPort = 53
-	}
+	
+	if tproxyPort == 0 { tproxyPort = 7893 }
+	if dnsPort == 0 { dnsPort = 1053 }
 
-	// 1. 部署内核
+	// 2. 释放内核
 	if err := deploySingBox(); err != nil {
 		return err
 	}
 
-	// 2. 配置旁路由环境
-	fmt.Printf("[+] 启动旁路由模式 (TPROXY: %d, DNS: %d)...\n", tproxyPort, dnsPort)
+	// 3. 配置旁路由网络环境 (包含 rp_filter 修复)
+	fmt.Printf("[+] 正在同步配置: TPROXY=%d, DNS=%d\n", tproxyPort, dnsPort)
 	if err := setupNetwork(int(tproxyPort), int(dnsPort)); err != nil {
 		return err
 	}
 
-	// 3. 运行内核
+	// 4. 启动内核
 	cmd := exec.Command(SingBoxPath, "run", "-c", configPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -89,12 +86,12 @@ func runManager(c *cli.Context) error {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		fmt.Println("\n[!] 正在还原网络设置...")
+		fmt.Println("\n[!] 正在清理网络规则并退出...")
 		cleanNetwork()
 		os.Exit(0)
 	}()
 
-	fmt.Println("[*] 服务已就绪。请将局域网设备的网关和 DNS 指向本机器 IP。")
+	fmt.Println("[*] 旁路由已就绪。请确保手机网关和 DNS 指向本机器。")
 	return cmd.Run()
 }
 
@@ -118,12 +115,11 @@ func deploySingBox() error {
 }
 
 func setupNetwork(tproxyPort, dnsPort int) error {
-	// 开启内核转发
+	// A. 基础内核参数设置 (解决旁路由丢包核心)
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run()
-	// 关闭 ICMP 重定向，防止客户端绕过旁路由
-	exec.Command("sysctl", "-w", "net.ipv4.conf.all.send_redirects=0").Run()
 
+	// B. nftables 规则 (双栈劫持 + NAT 伪装)
 	nftScript := fmt.Sprintf(`
 		table inet %[1]s {
 			set bypass_list_v4 {
@@ -138,18 +134,16 @@ func setupNetwork(tproxyPort, dnsPort int) error {
 			chain prerouting {
 				type filter hook prerouting priority mangle; policy accept;
 
-				# 1. DNS 劫持 (关键)
+				# 1. DNS 劫持: 强制局域网 53 端口流量进入 Sing-box 的 %[4]d 端口
 				udp dport 53 tproxy to :%[4]d accept
 				tcp dport 53 tproxy to :%[4]d accept
 
-				# 2. 绕过局域网
+				# 2. 绕过
 				ip daddr @bypass_list_v4 return
 				ip6 daddr @bypass_list_v6 return
-
-				# 3. 绕过自身流量
 				meta mark 0xff return
 
-				# 4. TPROXY 转发
+				# 3. 透明代理: 强制进入 Sing-box 的 %[3]d 端口
 				meta l4proto { tcp, udp } meta mark set %[2]d tproxy to :%[3]d
 			}
 
@@ -166,7 +160,7 @@ func setupNetwork(tproxyPort, dnsPort int) error {
 
 			chain postrouting {
 				type nat hook postrouting priority srcnat; policy accept;
-				# 核心：地址伪装。让局域网流量的回程包能回到旁路由
+				# 解决回程路由: 将转发流量的源 IP 伪装成旁路由 IP
 				ip saddr 10.0.0.0/8 ip daddr != 10.0.0.0/8 masquerade
 				ip saddr 172.16.0.0/12 ip daddr != 172.16.0.0/12 masquerade
 				ip saddr 192.168.0.0/16 ip daddr != 192.168.0.0/16 masquerade
@@ -174,6 +168,7 @@ func setupNetwork(tproxyPort, dnsPort int) error {
 		}
 	`, TableName, FwMark, tproxyPort, dnsPort)
 
+	// C. 执行配置
 	cmds := [][]string{
 		{"nft", "-f", "-"},
 		{"ip", "rule", "add", "fwmark", fmt.Sprintf("%d", FwMark), "table", fmt.Sprintf("%d", RouteTable)},
