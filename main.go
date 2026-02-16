@@ -1,210 +1,173 @@
 package main
 
 import (
-	_ "embed"
-	"encoding/json"
-	"flag"
+	"embed"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
+	"runtime"
 	"syscall"
-	"time"
+
+	"github.com/tidwall/gjson"
+	"github.com/urfave/cli/v2"
 )
 
-//go:embed sing-box-core
-var embeddedSingBox []byte
+//go:embed bin/sing-box-*
+var boxEmbed embed.FS
 
-type Config struct {
-	Inbounds []struct {
-		Type   string `json:"type"`
-		Listen int    `json:"listen_port"`
-	} `json:"inbounds"`
-}
+const (
+	TableName    = "sb_tproxy"
+	RouteTable   = 100
+	FwMark       = 0x1
+	SingBoxPath  = "/usr/bin/sing-box"
+)
 
 func main() {
-	// 强制硬性参数检测
-	lan := flag.String("lan", "", "IPv4 内网网段 (必填, 例: 10.0.0.0/24)")
-	ipv6Mode := flag.String("ipv6", "", "IPv6 模式 (必填: enable | disable)")
-	configPath := flag.String("c", "", "配置文件路径 (必填)")
-	flag.Parse()
-
-	if *lan == "" || *configPath == "" || *ipv6Mode == "" {
-		fmt.Printf("\n[!] 启动失败: 缺少硬性参数\n用法: sudo ./sing-box-tproxy --lan 10.0.0.0/24 --ipv6 disable -c config.json\n")
-		os.Exit(1)
+	app := &cli.App{
+		Name:  "sb-manager",
+		Usage: "自带内核并自动安装的 Sing-box TPROXY 管理器",
+		Commands: []*cli.Command{
+			{
+				Name:  "run",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Required: true},
+				},
+				Action: runManager,
+			},
+		},
 	}
 
-	// 1. 进程检测：运行前必须检查并清理现有的 sing-box
-	checkAndKillExistingProcess()
-
-	// 2. 配置检测：提取 TProxy 端口，失败则不进行任何网络改动
-	port := getTProxyPortOrDie(*configPath)
-
-	// 3. 准备内核文件
-	tempDir := "/tmp/.sb_runtime"
-	os.MkdirAll(tempDir, 0755)
-	targetCore := filepath.Join(tempDir, "sing-box")
-	if err := os.WriteFile(targetCore, embeddedSingBox, 0755); err != nil {
-		log.Fatalf("[!] 释放内核失败: %v", err)
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
 	}
-	defer os.RemoveAll(tempDir)
+}
 
-	// 4. 加载规则：仅加载一次，失败则回滚并退出
-	fmt.Println("[*] 正在初始化网络规则 (包含详细 IPv4/IPv6 保留地址)...")
-	if err := setupRules(*lan, *ipv6Mode, port); err != nil {
-		fmt.Printf("[!] 网络规则加载失败: %v\n", err)
-		cleanup() 
-		os.Exit(1)
+func runManager(c *cli.Context) error {
+	configPath := c.String("config")
+
+	// 1. 权限检查
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("请使用 sudo 或 root 权限运行此程序")
 	}
 
-	// 5. 启动内核：设置父子进程同步死掉的属性
-	cmd := exec.Command(targetCore, "run", "-c", *configPath)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("[!] Sing-box 启动失败: %v，正在回滚规则...\n", err)
-		cleanup()
-		os.Exit(1)
+	// 2. 解析配置获取 TPROXY 端口
+	configData, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("读取配置失败: %v", err)
+	}
+	tproxyPort := gjson.Get(string(configData), `inbounds.#(type=="tproxy").listen_port`).Int()
+	if tproxyPort == 0 {
+		return fmt.Errorf("配置错误: 未在 inbounds 中找到 type: tproxy 的 listen_port")
 	}
 
-	fmt.Printf("[+] 启动成功! 模式: IPv4=%s, IPv6=%s, TProxyPort=%s\n", *lan, *ipv6Mode, port)
+	// 3. 释放 sing-box 到 /usr/bin
+	if err := deploySingBox(); err != nil {
+		return fmt.Errorf("部署内核失败: %v", err)
+	}
 
-	// 6. 退出监听与清理
-	done := make(chan error, 1)
+	// 4. 配置网络规则
+	fmt.Printf("正在配置网络规则 (TPROXY Port: %d)... ", tproxyPort)
+	if err := setupNetwork(int(tproxyPort)); err != nil {
+		return err
+	}
+	fmt.Println("成功")
+
+	// 5. 启动 sing-box
+	cmd := exec.Command(SingBoxPath, "run", "-c", configPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// 信号监听：优雅退出并清理规则
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		done <- cmd.Wait()
+		<-sigs
+		fmt.Println("\n正在清理网络规则并停止内核...")
+		cleanNetwork()
+		os.Exit(0)
 	}()
 
-	select {
-	case <-sigChan:
-		fmt.Println("\n[*] 接收到停止信号，正在清理环境...")
-	case err := <-done:
-		fmt.Printf("\n[!] 内核进程意外停止: %v，正在清理环境...\n", err)
-	}
-
-	cleanup()
-	fmt.Println("[+] 所有规则已清空，进程已杀灭，安全退出。")
+	return cmd.Run()
 }
 
-func checkAndKillExistingProcess() {
-	out, _ := exec.Command("pgrep", "-f", "sing-box").Output()
-	if len(strings.Fields(string(out))) > 0 {
-		fmt.Println("[!] 发现现有 sing-box 进程，正在强制清理...")
-		exec.Command("killall", "-9", "sing-box").Run()
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-func getTProxyPortOrDie(path string) string {
-	file, err := os.ReadFile(path)
+// 释放内核到 /usr/bin
+func deploySingBox() error {
+	embedPath := fmt.Sprintf("bin/sing-box-%s", runtime.GOARCH)
+	srcFile, err := boxEmbed.Open(embedPath)
 	if err != nil {
-		log.Fatalf("[!] 无法读取配置文件: %v", err)
+		return fmt.Errorf("不支持的架构: %s", runtime.GOARCH)
 	}
-	var cfg Config
-	if err := json.Unmarshal(file, &cfg); err != nil {
-		log.Fatalf("[!] 配置文件 JSON 解析失败: %v", err)
+	defer srcFile.Close()
+
+	// 如果文件已存在，先尝试删除（防止 text file busy 错误）
+	os.Remove(SingBoxPath)
+
+	dstFile, err := os.OpenFile(SingBoxPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("无法写入 /usr/bin: %v (尝试 sudo)", err)
 	}
-	for _, in := range cfg.Inbounds {
-		if in.Type == "tproxy" && in.Listen != 0 {
-			return fmt.Sprintf("%d", in.Listen)
-		}
-	}
-	fmt.Println("[!] 错误: config.json 中未发现有效的 tproxy 入站配置，拒绝运行。")
-	os.Exit(1)
-	return ""
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
 
-func setupRules(lan, ipv6Mode, port string) error {
-	cleanupNetwork()
+// 网络规则配置
+func setupNetwork(port int) error {
+	nftScript := fmt.Sprintf(`
+		table inet %[1]s {
+			set bypass_list_v4 {
+				type ipv4_addr; flags interval
+				elements = { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
+			}
+			set bypass_list_v6 {
+				type ipv6_addr; flags interval
+				elements = { ::1/128, fc00::/7, fe80::/10, ff00::/8 }
+			}
+			chain prerouting {
+				type filter hook prerouting priority mangle; policy accept;
+				ip daddr @bypass_list_v4 return
+				ip6 daddr @bypass_list_v6 return
+				meta l4proto { tcp, udp } meta mark set %[2]d tproxy to :%[3]d
+			}
+		}
+	`, TableName, FwMark, port)
 
-	// 1. 构建 IPv6 排除逻辑字符串
-	v6Rules := ""
-	if ipv6Mode == "enable" {
-		v6Rules = "ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001::/32, 2001:20::/28, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 } return"
+	// 命令列表：nftables, ip rule, ip route (v4 & v6)
+	cmds := [][]string{
+		{"nft", "-f", "-"},
+		{"ip", "rule", "add", "fwmark", fmt.Sprintf("%d", FwMark), "table", fmt.Sprintf("%d", RouteTable)},
+		{"ip", "route", "add", "local", "default", "dev", "lo", "table", fmt.Sprintf("%d", RouteTable)},
+		{"ip", "-6", "rule", "add", "fwmark", fmt.Sprintf("%d", FwMark), "table", fmt.Sprintf("%d", RouteTable)},
+		{"ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", fmt.Sprintf("%d", RouteTable)},
 	}
 
-	// 2. 这里的模板采用了更标准的 nft 语法
-	nftRules := fmt.Sprintf(`
-table inet singbox_tproxy {
-    # 将集合放在 chain 外面，以便多个 chain 共享
-    set RESERVED_IP4 { 
-        type ipv4_addr; flags interval; 
-        elements = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 } 
-    }
-
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
-        
-        ip daddr @RESERVED_IP4 return
-        %s
-        
-        # 排除局域网非 DNS 流量
-        ip daddr %s tcp dport != 53 return
-        ip daddr %s udp dport != 53 return
-
-        meta l4proto { tcp, udp } tproxy to :%s meta mark set 1
-    }
-
-    chain output {
-        type route hook output priority mangle; policy accept;
-        
-        ip daddr @RESERVED_IP4 return
-        %s
-
-        # 环路保护
-        meta mark 0x00001ed5 return
-        meta mark 1 return
-
-        meta l4proto { tcp, udp } meta mark set 1
-    }
-}`, v6Rules, lan, lan, port, v6Rules)
-
-	// 调试用：如果还是报错，你可以查看这个文件
-	os.WriteFile("/tmp/sb.nft", []byte(nftRules), 0644)
-	
-	// 执行加载
-	cmd := exec.Command("nft", "-f", "/tmp/sb.nft")
-	var errOut strings.Builder
-	cmd.Stderr = &errOut
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("nft 语法错误: %s", errOut.String())
-	}
-
-	// 策略路由
-	exec.Command("ip", "rule", "add", "fwmark", "1", "lookup", "100").Run()
-	exec.Command("ip", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
-	if ipv6Mode == "enable" {
-		exec.Command("ip", "-6", "rule", "add", "fwmark", "1", "lookup", "100").Run()
-		exec.Command("ip", "-6", "route", "add", "local", "default", "dev", "lo", "table", "100").Run()
+	for i, c := range cmds {
+		cmd := exec.Command(c[0], c[1:]...)
+		if i == 0 { // 处理 nftables 脚本输入
+			stdin, _ := cmd.StdinPipe()
+			go func() {
+				defer stdin.Close()
+				stdin.Write([]byte(nftScript))
+			}()
+		}
+		if err := cmd.Run(); err != nil {
+			// 如果规则已存在，允许继续执行
+			fmt.Printf("警告: 执行 %v 时出错 (可能已存在)\n", c)
+		}
 	}
 	return nil
 }
 
-func cleanupNetwork() {
-	// 强制删除所有可能的旧表名，防止干扰
-	exec.Command("nft", "delete", "table", "inet", "singbox_tproxy").Run()
-	exec.Command("nft", "delete", "table", "inet", "singbox").Run()
-	exec.Command("nft", "delete", "table", "ip", "singbox").Run()
-	
-	// 循环多次尝试删除策略路由，彻底解决 ip rule 堆叠重复问题
-	for i := 0; i < 3; i++ {
-		exec.Command("ip", "rule", "del", "fwmark", "1", "lookup", "100").Run()
-		exec.Command("ip", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
-		exec.Command("ip", "-6", "rule", "del", "fwmark", "1", "lookup", "100").Run()
-		exec.Command("ip", "-6", "route", "del", "local", "default", "dev", "lo", "table", "100").Run()
-	}
-}
-
-func cleanup() {
-	// 1. 杀掉内核进程
-	exec.Command("killall", "-9", "sing-box").Run()
-	// 2. 清理网络规则
-	cleanupNetwork()
+func cleanNetwork() {
+	exec.Command("nft", "delete", "table", "inet", TableName).Run()
+	exec.Command("ip", "rule", "del", "fwmark", fmt.Sprintf("%d", FwMark)).Run()
+	exec.Command("ip", "route", "del", "local", "default", "table", fmt.Sprintf("%d", RouteTable)).Run()
+	exec.Command("ip", "-6", "rule", "del", "fwmark", fmt.Sprintf("%d", FwMark)).Run()
+	exec.Command("ip", "-6", "route", "del", "local", "default", "table", fmt.Sprintf("%d", RouteTable)).Run()
 }
