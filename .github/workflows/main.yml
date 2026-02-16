@@ -1,61 +1,56 @@
-name: All-in-One Build
+name: All-in-One Build and Release
 
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch: # 支持手动触发构建
+  workflow_dispatch: # 同时也支持手动触发构建
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 必须赋予写入权限才能创建 Release
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
-      - name: Download Latest Sing-box Kernels
+      - name: Download Latest Sing-box
         run: |
           mkdir -p bin
-          # 获取最新版本号 (例如 1.8.0)
           LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
-          echo "Latest Sing-box version: $LATEST_TAG"
-
-          # 下载并解压 AMD64 版本
+          
+          # 下载并准备 AMD64 内核
           curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-amd64.tar.gz" -o sb-amd64.tar.gz
           tar -xzf sb-amd64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-amd64/sing-box
           mv bin/sing-box bin/sing-box-amd64
 
-          # 下载并解压 ARM64 版本
+          # 下载并准备 ARM64 内核
           curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-arm64.tar.gz" -o sb-arm64.tar.gz
           tar -xzf sb-arm64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-arm64/sing-box
           mv bin/sing-box bin/sing-box-arm64
-          
-          # 清理压缩包
           rm *.tar.gz
 
-      - name: Initialize Go Module
+      - name: Go Build
         run: |
-          # 如果仓库里没有 go.mod，则初始化
-          if [ ! -f go.mod ]; then
-            go mod init sb-manager
-          fi
-          # 下载代码中用到的 gjson, cli 等依赖
+          [ -f go.mod ] || go mod init sb-manager
           go mod tidy
-          
-      - name: Build Manager (AMD64)
-        run: |
+          # 静态编译并移除调试符号以减小体积
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o sb-manager-amd64 .
-
-      - name: Build Manager (ARM64)
-        run: |
           GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o sb-manager-arm64 .
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: sb-manager-binaries
-          path: sb-manager-*
+          name: "Release ${{ github.ref_name }}"
+          tag_name: ${{ github.ref }}
+          draft: false
+          prerelease: false
+          files: |
+            sb-manager-amd64
+            sb-manager-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
