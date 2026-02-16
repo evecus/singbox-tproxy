@@ -1,13 +1,13 @@
-name: All-in-One Build and Release
+name: All-in-One Build
 
 on:
-  workflow_dispatch: # 同时也支持手动触发构建
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-and-release:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 必须赋予写入权限才能创建 Release
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -22,35 +22,31 @@ jobs:
           mkdir -p bin
           LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
           
-          # 下载并准备 AMD64 内核
+          # AMD64
           curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-amd64.tar.gz" -o sb-amd64.tar.gz
           tar -xzf sb-amd64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-amd64/sing-box
           mv bin/sing-box bin/sing-box-amd64
 
-          # 下载并准备 ARM64 内核
+          # ARM64
           curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-arm64.tar.gz" -o sb-arm64.tar.gz
           tar -xzf sb-arm64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-arm64/sing-box
           mv bin/sing-box bin/sing-box-arm64
           rm *.tar.gz
 
-      - name: Go Build
+      - name: Go Tidy and Build
         run: |
+          # 自动初始化模块防止报错
           [ -f go.mod ] || go mod init sb-manager
           go mod tidy
-          # 静态编译并移除调试符号以减小体积
+          
+          # 编译 AMD64
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o sb-manager-amd64 .
+          
+          # 编译 ARM64
           GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o sb-manager-arm64 .
 
-      - name: Create Release and Upload
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: "Release ${{ github.ref_name }}"
-          tag_name: ${{ github.ref }}
-          draft: false
-          prerelease: false
-          files: |
-            sb-manager-amd64
-            sb-manager-arm64
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: sb-manager-binaries
+          path: sb-manager-*
