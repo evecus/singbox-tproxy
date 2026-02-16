@@ -37,6 +37,15 @@ jobs:
           # 清理压缩包
           rm *.tar.gz
 
+      - name: Initialize Go Module
+        run: |
+          # 如果仓库里没有 go.mod，则初始化
+          if [ ! -f go.mod ]; then
+            go mod init sb-manager
+          fi
+          # 下载代码中用到的 gjson, cli 等依赖
+          go mod tidy
+          
       - name: Build Manager (AMD64)
         run: |
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o sb-manager-amd64 .
