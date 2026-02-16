@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 
@@ -50,12 +49,10 @@ func main() {
 func runManager(c *cli.Context) error {
 	configPath := c.String("config")
 
-	// 1. 权限检查
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("请使用 sudo 或 root 权限运行此程序")
 	}
 
-	// 2. 解析配置获取 TPROXY 端口
 	configData, err := ioutil.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("读取配置失败: %v", err)
@@ -65,24 +62,20 @@ func runManager(c *cli.Context) error {
 		return fmt.Errorf("配置错误: 未在 inbounds 中找到 type: tproxy 的 listen_port")
 	}
 
-	// 3. 释放 sing-box 到 /usr/bin
 	if err := deploySingBox(); err != nil {
 		return fmt.Errorf("部署内核失败: %v", err)
 	}
 
-	// 4. 配置网络规则
 	fmt.Printf("正在配置网络规则 (TPROXY Port: %d)... ", tproxyPort)
 	if err := setupNetwork(int(tproxyPort)); err != nil {
 		return err
 	}
 	fmt.Println("成功")
 
-	// 5. 启动 sing-box
 	cmd := exec.Command(SingBoxPath, "run", "-c", configPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// 信号监听：优雅退出并清理规则
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -95,7 +88,6 @@ func runManager(c *cli.Context) error {
 	return cmd.Run()
 }
 
-// 释放内核到 /usr/bin
 func deploySingBox() error {
 	embedPath := fmt.Sprintf("bin/sing-box-%s", runtime.GOARCH)
 	srcFile, err := boxEmbed.Open(embedPath)
@@ -104,9 +96,7 @@ func deploySingBox() error {
 	}
 	defer srcFile.Close()
 
-	// 如果文件已存在，先尝试删除（防止 text file busy 错误）
 	os.Remove(SingBoxPath)
-
 	dstFile, err := os.OpenFile(SingBoxPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 	if err != nil {
 		return fmt.Errorf("无法写入 /usr/bin: %v (尝试 sudo)", err)
@@ -117,7 +107,6 @@ func deploySingBox() error {
 	return err
 }
 
-// 网络规则配置
 func setupNetwork(port int) error {
 	nftScript := fmt.Sprintf(`
 		table inet %[1]s {
@@ -138,7 +127,6 @@ func setupNetwork(port int) error {
 		}
 	`, TableName, FwMark, port)
 
-	// 命令列表：nftables, ip rule, ip route (v4 & v6)
 	cmds := [][]string{
 		{"nft", "-f", "-"},
 		{"ip", "rule", "add", "fwmark", fmt.Sprintf("%d", FwMark), "table", fmt.Sprintf("%d", RouteTable)},
@@ -149,17 +137,14 @@ func setupNetwork(port int) error {
 
 	for i, c := range cmds {
 		cmd := exec.Command(c[0], c[1:]...)
-		if i == 0 { // 处理 nftables 脚本输入
+		if i == 0 {
 			stdin, _ := cmd.StdinPipe()
 			go func() {
 				defer stdin.Close()
 				stdin.Write([]byte(nftScript))
 			}()
 		}
-		if err := cmd.Run(); err != nil {
-			// 如果规则已存在，允许继续执行
-			fmt.Printf("警告: 执行 %v 时出错 (可能已存在)\n", c)
-		}
+		_ = cmd.Run() 
 	}
 	return nil
 }
