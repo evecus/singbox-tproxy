@@ -1,52 +1,63 @@
-name: All-in-One Build
+name: Build Custom Sing-box with Auto-TProxy
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            goos: linux
+          - goarch: arm64
+            goos: linux
+
     steps:
-      - name: Checkout Code
+      - name: Checkout Your Patches
         uses: actions/checkout@v4
 
-      - name: Set up Go
+      - name: Clone Sing-box Source
+        run: |
+          git clone --depth 1 https://github.com/SagerNet/sing-box.git sb_src
+
+      - name: Inject Custom Logic
+        run: |
+          # 1. 复制注入文件到 cmd/sing-box 目录
+          cp patches/inject.go sb_src/cmd/sing-box/inject.go
+          
+          # 2. 修改 main.go 以注入执行入口
+          # 在 func main() { 之后插入调用代码
+          # 注意：sing-box 默认 config 路径解析在内部，此处我们硬编码读取 config.json
+          sed -i '/func main() {/a \	AutoNetworkManager("config.json")' sb_src/cmd/sing-box/main.go
+
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
 
-      - name: Download Latest Sing-box
+      - name: Build Core
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
         run: |
-          mkdir -p bin
-          LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
-          
-          # AMD64
-          curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-amd64.tar.gz" -o sb-amd64.tar.gz
-          tar -xzf sb-amd64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-amd64/sing-box
-          mv bin/sing-box bin/sing-box-amd64
+          cd sb_src
+          go build -v -trimpath -ldflags "-s -w" -tags "with_gvisor,with_quic,with_utls,with_clash_api" -o ../sb-${{ matrix.goarch }} ./cmd/sing-box
 
-          # ARM64
-          curl -L "https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-${LATEST_TAG}-linux-arm64.tar.gz" -o sb-arm64.tar.gz
-          tar -xzf sb-arm64.tar.gz --strip-components=1 -C bin/ sing-box-${LATEST_TAG}-linux-arm64/sing-box
-          mv bin/sing-box bin/sing-box-arm64
-          rm *.tar.gz
-
-      - name: Go Tidy and Build
-        run: |
-          # 自动初始化模块防止报错
-          [ -f go.mod ] || go mod init sb-manager
-          go mod tidy
-          
-          # 编译 AMD64
-          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o sb-manager-amd64 .
-          
-          # 编译 ARM64
-          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o sb-manager-arm64 .
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          name: sb-manager-binaries
-          path: sb-manager-*
+          files: sb-*
+          tag_name: custom-sing-box
+          name: "Custom Sing-box (Auto-TProxy)"
+          body: "此版本集成自动旁路由网络配置逻辑。使用方法: sudo ./sb-xxx run --lan 10.0.0.0/24 -c config.json"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
