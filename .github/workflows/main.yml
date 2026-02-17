@@ -1,4 +1,4 @@
-name: Build Custom Sing-box with Auto-TProxy
+name: Build Custom Sing-box
 
 on:
   workflow_dispatch:
@@ -15,49 +15,38 @@ jobs:
       matrix:
         include:
           - goarch: amd64
-            goos: linux
           - goarch: arm64
-            goos: linux
 
     steps:
-      - name: Checkout Your Patches
+      - name: Checkout Patches
         uses: actions/checkout@v4
 
-      - name: Clone Sing-box Source
-        run: |
-          git clone --depth 1 https://github.com/SagerNet/sing-box.git sb_src
+      - name: Clone Source
+        run: git clone --depth 1 https://github.com/SagerNet/sing-box.git sb_src
 
-      - name: Inject Custom Logic
+      - name: Inject
         run: |
-          # 1. 复制注入文件到 cmd/sing-box 目录
           cp patches/inject.go sb_src/cmd/sing-box/inject.go
-          
-          # 2. 修改 main.go 以注入执行入口
-          # 在 func main() { 之后插入调用代码
-          # 注意：sing-box 默认 config 路径解析在内部，此处我们硬编码读取 config.json
-          sed -i '/func main() {/a \	AutoNetworkManager("config.json")' sb_src/cmd/sing-box/main.go
+          # 注入逻辑：在 main 函数开头预处理参数
+          sed -i '/func main() {/a \	for i, arg := range os.Args { if arg == "--lan" && i+1 < len(os.Args) { LanAddr = os.Args[i+1]; os.Args = append(os.Args[:i], os.Args[i+2:]...); break } }; AutoNetworkManager(os.Args)' sb_src/cmd/sing-box/main.go
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
-      - name: Build Core
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+      - name: Build
         run: |
           cd sb_src
-          go build -v -trimpath -ldflags "-s -w" -tags "with_gvisor,with_quic,with_utls,with_clash_api" -o ../sb-${{ matrix.goarch }} ./cmd/sing-box
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -v -trimpath -ldflags "-s -w" -tags "with_gvisor,with_quic,with_utls,with_clash_api" -o ../sb-linux-${{ matrix.goarch }} ./cmd/sing-box
 
-      - name: Release and Upload Assets
+      - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          files: sb-*
-          tag_name: custom-sing-box
-          name: "Custom Sing-box (Auto-TProxy)"
-          body: "此版本集成自动旁路由网络配置逻辑。使用方法: sudo ./sb-xxx run --lan 10.0.0.0/24 -c config.json"
+          files: sb-linux-*
+          tag_name: latest
+          name: "Custom Sing-box with Auto-TProxy"
+          body: "使用方法: sudo ./sb-linux-xxx run --lan 10.0.0.0/24 -c config.json"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
