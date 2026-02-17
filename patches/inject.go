@@ -11,18 +11,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// AutoNetworkManager 固定为 10.0.0.0/24
+// AutoNetworkManager 处理网络配置
 func AutoNetworkManager(configPath string) {
-	// 仅在 root 权限下运行，且不是 version/help 命令时执行
+	// 排除非 root 和 帮助命令
 	if os.Geteuid() != 0 || (len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "help")) {
 		return
 	}
 
 	lan := "10.0.0.0/24"
-
-	// 1. 尝试从 config.json 提取端口，提取不到则使用默认值
-	content, err := os.ReadFile(configPath)
 	var tproxyPort, dnsPort int64 = 7893, 1053
+
+	// 读取配置文件提取端口
+	content, err := os.ReadFile(configPath)
 	if err == nil {
 		t := gjson.Get(string(content), `inbounds.#(type=="tproxy").listen_port`).Int()
 		if t != 0 { tproxyPort = t }
@@ -30,17 +30,17 @@ func AutoNetworkManager(configPath string) {
 		if d != 0 { dnsPort = d }
 	}
 
-	fmt.Printf("[+] 旁路由模式(固定LAN): %s, TPROXY:%d, DNS:%d\n", lan, tproxyPort, dnsPort)
+	fmt.Printf("[+] 旁路由模式启动: LAN=%s, TPROXY=%d, DNS=%d\n", lan, tproxyPort, dnsPort)
 
-	// 2. 执行网络配置
+	// 配置网络
 	setup(tproxyPort, dnsPort, lan)
 
-	// 3. 注册退出清理
+	// 监听信号清理退出
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		fmt.Println("\n[!] 正在清理网络规则并退出...")
+		fmt.Println("\n[!] 正在清理网络规则...")
 		cleanup(lan)
 		os.Exit(0)
 	}()
@@ -51,10 +51,9 @@ func setup(tPort, dPort int64, lan string) {
 	exec.Command("sysctl", "-w", "net.ipv4.conf.all.rp_filter=0").Run()
 	exec.Command("sysctl", "-w", "net.ipv4.conf.default.rp_filter=0").Run()
 
-	nftScript := fmt.Sprintf(`
+	nft := fmt.Sprintf(`
 define RESERVED_IP4 = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 }
 define RESERVED_IP6 = { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001::/32, 2001:20::/28, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 }
-
 table inet singbox_auto {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
@@ -80,7 +79,7 @@ table inet singbox_auto {
 }`, tPort, dPort, lan)
 
 	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(nftScript)
+	cmd.Stdin = strings.NewReader(nft)
 	cmd.Run()
 
 	exec.Command("ip", "rule", "add", "fwmark", "1", "table", "100").Run()
