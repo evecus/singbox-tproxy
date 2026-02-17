@@ -13,42 +13,53 @@ jobs:
       contents: write
     strategy:
       matrix:
-        include:
-          - goarch: amd64
-          - goarch: arm64
+        goarch: [amd64, arm64]
 
     steps:
-      - name: Checkout Patches
+      - name: Checkout Your Patches
         uses: actions/checkout@v4
 
-      - name: Clone Source
+      - name: Clone Official Source
         run: git clone --depth 1 https://github.com/SagerNet/sing-box.git sb_src
 
-      - name: Inject
+      - name: Inject Logic
         run: |
-          # 1. 复制注入代码文件
+          # 拷贝注入代码
           cp patches/inject.go sb_src/cmd/sing-box/inject.go
           
-          # 2. 在 main.go 的 import 块中注入 "os" 包
-          # sing-box 的 main.go 通常已有 import 块，我们强制在第一行 import 后面插入 "os"
-          sed -i '/import (/a \	"os"' sb_src/cmd/sing-box/main.go || sed -i 's/package main/package main\n\nimport "os"/' sb_src/cmd/sing-box/main.go
+          # 修改 main.go：添加 import 并注入 AutoNetworkManager 调用
+          cd sb_src/cmd/sing-box
+          
+          # 使用 perl 代替 sed 以更好地处理多行注入，避免引号冲突
+          perl -i -pe 'print "import \"os\"\n" if /^package main/' main.go
+          
+          # 在 func main() { 后插入参数识别逻辑和网络启动逻辑
+          perl -i -0777 -pe 's/func main\(\) \{/func main() {\n\tconfigPath := "config.json"\n\tfor i, arg := range os.Args {\n\t\tif (arg == "-c" || arg == "--config") && i+1 < len(os.Args) {\n\t\t\tconfigPath = os.Args[i+1]\n\t\t}\n\t}\n\tAutoNetworkManager(configPath)/' main.go
 
-          # 3. 注入逻辑：在 main 函数开头预处理参数
-          # 注意：这里使用了更稳健的插入方式，并确保引用了预期的变量名
-          sed -i '/func main() {/a \	for i, arg := range os.Args { if arg == "--lan" && i+1 < len(os.Args) { LanAddr = os.Args[i+1]; os.Args = append(os.Args[:i], os.Args[i+2:]...); break } }; AutoNetworkManager(os.Args)' sb_src/cmd/sing-box/main.go
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
-      - name: Build
+      - name: Build Core
         run: |
           cd sb_src
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -v -trimpath -ldflags "-s -w" -tags "with_gvisor,with_quic,with_utls,with_clash_api" -o ../sb-linux-${{ matrix.goarch }} ./cmd/sing-box
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -v -trimpath \
+            -ldflags "-s -w" \
+            -tags "with_gvisor,with_quic,with_utls,with_clash_api" \
+            -o ../sb-linux-${{ matrix.goarch }} ./cmd/sing-box
 
-      - name: Release
+      - name: Release and Upload Assets
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           files: sb-linux-*
           tag_name: latest
-          name: "Custom Sing-box with Auto-TProxy"
-          body: "使用方法: sudo ./sb-linux-xxx run --lan 10.0.0.0/24 -c config.json"
+          name: "Custom Sing-box (Fixed TProxy/DNS)"
+          body: |
+            ### 定制版 Sing-box
+            - **固定 LAN**: 10.0.0.0/24
+            - **自动化**: 自动配置 nftables 和 策略路由
+            - **用法**: `sudo ./sb-linux-amd64 run -c config.json`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
