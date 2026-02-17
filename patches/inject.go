@@ -11,48 +11,37 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// 定义一个全局变量来存储 LAN 地址
-var LanAddr string
-
-// AutoNetworkManager 处理网络初始化和清理
-func AutoNetworkManager(args []string) {
-	// 查找 -c 或 --config 参数获取配置文件路径
-	configPath := "config.json"
-	for i, arg := range args {
-		if (arg == "-c" || arg == "--config") && i+1 < len(args) {
-			configPath = args[i+1]
-			break
-		}
-	}
-
-	if LanAddr == "" || os.Geteuid() != 0 {
+// AutoNetworkManager 固定为 10.0.0.0/24
+func AutoNetworkManager(configPath string) {
+	// 仅在 root 权限下运行，且不是 version/help 命令时执行
+	if os.Geteuid() != 0 || (len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "help")) {
 		return
 	}
 
-	// 1. 提取配置端口
+	lan := "10.0.0.0/24"
+
+	// 1. 尝试从 config.json 提取端口，提取不到则使用默认值
 	content, err := os.ReadFile(configPath)
-	if err != nil {
-		fmt.Printf("[!] 无法读取配置文件: %v\n", err)
-		return
+	var tproxyPort, dnsPort int64 = 7893, 1053
+	if err == nil {
+		t := gjson.Get(string(content), `inbounds.#(type=="tproxy").listen_port`).Int()
+		if t != 0 { tproxyPort = t }
+		d := gjson.Get(string(content), `inbounds.#(tag=="dns-in").listen_port`).Int()
+		if d != 0 { dnsPort = d }
 	}
-	
-	tproxyPort := gjson.Get(string(content), `inbounds.#(type=="tproxy").listen_port`).Int()
-	dnsPort := gjson.Get(string(content), `inbounds.#(tag=="dns-in").listen_port`).Int()
-	if tproxyPort == 0 { tproxyPort = 7893 }
-	if dnsPort == 0 { dnsPort = 1053 }
 
-	fmt.Printf("[+] 旁路由自动模式: LAN=%s, TPROXY=%d, DNS=%d\n", LanAddr, tproxyPort, dnsPort)
+	fmt.Printf("[+] 旁路由模式(固定LAN): %s, TPROXY:%d, DNS:%d\n", lan, tproxyPort, dnsPort)
 
-	// 2. 配置网络
-	setup(tproxyPort, dnsPort, LanAddr)
+	// 2. 执行网络配置
+	setup(tproxyPort, dnsPort, lan)
 
-	// 3. 信号监听退出
+	// 3. 注册退出清理
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		fmt.Println("\n[!] 正在清理网络规则...")
-		cleanup(LanAddr)
+		fmt.Println("\n[!] 正在清理网络规则并退出...")
+		cleanup(lan)
 		os.Exit(0)
 	}()
 }
@@ -60,7 +49,8 @@ func AutoNetworkManager(args []string) {
 func setup(tPort, dPort int64, lan string) {
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	exec.Command("sysctl", "-w", "net.ipv4.conf.all.rp_filter=0").Run()
-	
+	exec.Command("sysctl", "-w", "net.ipv4.conf.default.rp_filter=0").Run()
+
 	nftScript := fmt.Sprintf(`
 define RESERVED_IP4 = { 100.64.0.0/10, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32 }
 define RESERVED_IP6 = { ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001::/32, 2001:20::/28, 2001:db8::/32, 2002::/16, fc00::/7, fe80::/10, ff00::/8 }
