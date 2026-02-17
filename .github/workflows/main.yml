@@ -24,22 +24,24 @@ jobs:
 
       - name: Inject Logic
         run: |
-          # 拷贝注入代码
+          # 1. 拷贝注入代码
           cp patches/inject.go sb_src/cmd/sing-box/inject.go
           
-          # 修改 main.go：添加 import 并注入 AutoNetworkManager 调用
+          # 2. 修改 main.go
           cd sb_src/cmd/sing-box
           
-          # 使用 perl 代替 sed 以更好地处理多行注入，避免引号冲突
-          perl -i -pe 'print "import \"os\"\n" if /^package main/' main.go
+          # 清除可能存在的旧注入（幂等性处理），防止重复构建报错
+          sed -i '/AutoNetworkManager/d' main.go
           
-          # 在 func main() { 后插入参数识别逻辑和网络启动逻辑
-          perl -i -0777 -pe 's/func main\(\) \{/func main() {\n\tconfigPath := "config.json"\n\tfor i, arg := range os.Args {\n\t\tif (arg == "-c" || arg == "--config") && i+1 < len(os.Args) {\n\t\t\tconfigPath = os.Args[i+1]\n\t\t}\n\t}\n\tAutoNetworkManager(configPath)/' main.go
+          # 使用 perl 插入 import "os" 到 package main 后面（如果不存在）
+          perl -i -pe 's/^package main\s*$/package main\n\nimport "os"/' main.go
+          
+          # 使用 perl 替换 func main() { 块
+          # 这里的逻辑是：匹配 func main() { 然后在后面接上参数提取和 AutoNetworkManager 调用
+          perl -i -0777 -pe 's/func main\(\) \{/func main() {\n\tconfigPath := "config.json"\n\tfor i, arg := range os.Args {\n\t\tif (arg == "-c" || arg == "--config") && i+1 < len(os.Args) {\n\t\t\tconfigPath = os.Args[i+1]\n\t\t}\n\t}\n\tAutoNetworkManager(configPath)/g' main.go
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
+          # 验证结果（调试用）
+          head -n 20 main.go
 
       - name: Build Core
         run: |
